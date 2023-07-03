@@ -23,6 +23,7 @@ import {
     Source,
     StackFrame,
     TerminatedEvent,
+    ThreadEvent,
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { GDBBackend } from './GDBBackend';
@@ -313,6 +314,7 @@ export class GDBDebugSession extends LoggingDebugSession {
         response.body.supportsDisassembleRequest = true;
         response.body.supportsReadMemoryRequest = true;
         response.body.supportsWriteMemoryRequest = true;
+        response.body.supportsTerminateThreadsRequest = true;
         this.sendResponse(response);
     }
 
@@ -1585,6 +1587,35 @@ export class GDBDebugSession extends LoggingDebugSession {
         }
     }
 
+    protected async terminateThreadsRequest(
+        response: DebugProtocol.TerminateThreadsResponse,
+        args: DebugProtocol.TerminateThreadsArguments
+    ) {
+        try {
+            if (args.threadIds !== undefined) {
+                const threadIds: number[] = args.threadIds;
+                threadIds.forEach(async (threadGroupId) => {
+                    // If we are running the target-async support, there is a bug with GDB 7.12
+                    // where after we terminate the process, the GDB prompt does not come
+                    // back in the console.  As a workaround, we first interrupt the process
+                    // to get the prompt back, and only then kill the process.
+                    // https://sourceware.org/bugzilla/show_bug.cgi?id=20766
+                    this.gdb.pause(threadGroupId);
+                    mi.sendInterpreterExecThreadGroupKill(this.gdb, {
+                        threadGroupId: threadGroupId,
+                    });
+                });
+            }
+            this.sendResponse(response);
+        } catch (err) {
+            this.sendErrorResponse(
+                response,
+                1,
+                err instanceof Error ? err.message : String(err)
+            );
+        }
+    }
+
     protected async disconnectRequest(
         response: DebugProtocol.DisconnectResponse,
         _args: DebugProtocol.DisconnectArguments
@@ -1769,10 +1800,16 @@ export class GDBDebugSession extends LoggingDebugSession {
                 this.threads = this.threads.filter((t) => t.id !== exitId);
                 break;
             }
+            case 'thread-group-exited': {
+                const thread: mi.MIThreadInfo = notifyData;
+                const exitId = parseInt(thread.id.split('i')[1], 10);
+                this.threads = this.threads.filter((t) => t.id !== exitId);
+                this.sendEvent(new ThreadEvent('exited', exitId));
+                break;
+            }
             case 'thread-selected':
             case 'thread-group-added':
             case 'thread-group-started':
-            case 'thread-group-exited':
             case 'library-loaded':
             case 'breakpoint-modified':
             case 'breakpoint-deleted':
